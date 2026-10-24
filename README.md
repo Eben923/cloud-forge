@@ -1,157 +1,141 @@
 # Cloud Forge
 
-A lightweight micro-PaaS prototype that accepts Python source-code archives, synthesises sandboxed Docker images, and executes containers under strict Linux resource limits.
+A lightweight micro-PaaS platform that accepts Python source-code archives, synthesises sandboxed Docker images, and executes containers under strict Linux resource limits.
 
-Built with **FastAPI · React 19 · PostgreSQL · Docker**.
+Built with **FastAPI · React 19 · PostgreSQL · Docker · Nginx · AWS EC2**.
 
 ---
 
-## What it does
+## Live AWS Deployment
 
-1. **Upload** — submit a ZIP file containing a Python script (`main.py` or a single `.py` file).
-2. **Build** — Cloud Forge generates a minimal `python:3.13-slim` Dockerfile and builds a tagged image via the local Docker daemon. No user-supplied Dockerfile is used.
-3. **Deploy** — the image runs in an isolated container with cgroup limits (128 MiB RAM, 0.5 CPU, 64 PIDs), a read-only root filesystem, all Linux capabilities dropped, and network access disabled.
-4. **Audit** — exit code, stdout/stderr, and timestamps are persisted in PostgreSQL.
+Cloud Forge is actively deployed on **Amazon Web Services (AWS)** in `ap-southeast-2` (Sydney):
 
-> **Scope:** Only self-contained Python scripts are supported. Projects that require `pip install` at runtime cannot be used because the build step runs with `network_mode="none"` and the generated Dockerfile contains no `RUN` steps.
+* **Live Dashboard:** [http://54.252.152.116/](http://54.252.152.116/)
+* **Health API Endpoint:** [http://54.252.152.116/health](http://54.252.152.116/health)
+* **REST Projects Endpoint:** [http://54.252.152.116/projects](http://54.252.152.116/projects)
+* **AWS Architecture:** EC2 Nitro (`t3.micro`), Amazon Linux 2023, Amazon VPC, Nginx reverse proxy, and Docker containerized PostgreSQL 15 with persistent EBS host volumes.
+
+---
+
+## What It Does
+
+1. **Upload** — Submit a ZIP file containing Python application code (`main.py` or a single `.py` file).
+2. **Build** — Cloud Forge generates a clean, minimal `python:3.13-slim` Dockerfile and builds a tagged image via the local Docker daemon. No untrusted user-supplied Dockerfile instructions are executed.
+3. **Deploy** — The container launches under strict Linux isolation primitives (128 MiB RAM, 0.5 CPU quota, 64 PIDs ceiling), read-only root filesystem, dropped Linux capabilities (`cap_drop=["ALL"]`), unprivileged user (`nobody`), and network disabled (`network_disabled=True`).
+4. **Audit** — Execution logs, container exit codes, and timestamps are saved relationally to PostgreSQL.
 
 ---
 
 ## Prerequisites
 
-| Tool | Minimum version | Notes |
-|------|----------------|-------|
-| Python | 3.13 | Backend runtime |
-| Node.js | 22 | Frontend build |
-| Docker Desktop | any recent | Must be running |
-| PostgreSQL | 15+ | Can run in Docker (see below) |
+| Tool | Minimum Version | Notes |
+| :--- | :--- | :--- |
+| **Python** | 3.11+ / 3.13 | Backend runtime environment |
+| **Node.js** | 20+ / 22 | Frontend Vite build tooling |
+| **Docker** | 24+ / 25+ | Required for builds and sandboxed runs |
+| **PostgreSQL** | 15+ | Runs via Docker container with volume persistence |
 
 ---
 
-## Quick start
+## Quick Start (Local Setup)
 
-### 1. Clone
-
+### 1. Clone the Repository
 ```bash
 git clone https://github.com/Eben923/cloud-forge.git
 cd cloud-forge
 ```
 
-### 2. Start PostgreSQL
+### 2. Configure Environment Variables
+```bash
+cp .env.example .env
+# Set your DATABASE_URL in .env
+```
 
+### 3. Start PostgreSQL Container
 ```bash
 docker run -d \
   --name cloudforge-db \
+  --restart unless-stopped \
   -e POSTGRES_USER=cloudforge \
-  -e POSTGRES_PASSWORD=<choose-a-password> \
+  -e POSTGRES_PASSWORD=your_secure_password \
   -e POSTGRES_DB=cloudforge \
-  -p 5432:5432 \
+  -v cloudforge-pgdata:/var/lib/postgresql/data \
+  -p 127.0.0.1:5432:5432 \
   postgres:15-alpine
 ```
 
-### 3. Configure the backend
-
-```bash
-cp .env.example .env
-# Edit .env and set DATABASE_URL to match the credentials above
-```
-
-### 4. Create the virtual environment and install dependencies
-
+### 4. Setup Python Virtual Environment
 ```bash
 python -m venv .venv
 
 # Windows
-.venv\Scripts\pip install fastapi uvicorn[standard] sqlalchemy psycopg[binary] docker python-dotenv alembic pydantic-settings
+.\.venv\Scripts\activate
+pip install -r requirements.txt
 
-# macOS / Linux
-.venv/bin/pip install fastapi uvicorn[standard] sqlalchemy psycopg[binary] docker python-dotenv alembic pydantic-settings
+# Linux / macOS
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-> A `requirements.txt` is not yet committed to the repository. Use the package list above until one is added.
-
-### 5. Run the backend
-
+### 5. Start Backend API
 ```bash
-# Windows
-.venv\Scripts\python -m uvicorn main:app --host 127.0.0.1 --port 8000
-
-# macOS / Linux
-.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
+uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
-### 6. Install and run the frontend
-
+### 6. Start React Frontend
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
 
-Open **http://localhost:5173** in your browser.
+Open **http://localhost:5173** to access the local dashboard.
 
 ---
 
-## Sample test application
+## Sample Test Application
 
-A minimal Hello-World app is included in [`test-app/`](test-app/):
-
+A reproducible test application is provided in [`test-app/`](test-app/):
 ```
 test-app/
-  app.py          # print("Hello from Cloud Forge!")
-  Dockerfile      # reference only — Cloud Forge generates its own
+  ├── app.py          # print("Hello from Cloud Forge!")
+  └── Dockerfile      # Reference Dockerfile
 ```
 
-To test an end-to-end deployment:
-
-1. Zip the contents of `test-app/` (not the folder itself): `app.py` must be at the ZIP root.
-2. Create a project in the dashboard.
-3. Upload the ZIP, click **Build**, then **Deploy**.
-4. Expect exit code `0` and output `Hello from Cloud Forge!`.
-
 ---
 
-## Environment variables
-
-| Variable | Required | Example | Description |
-|----------|----------|---------|-------------|
-| `DATABASE_URL` | Yes | `postgresql+psycopg://user:pass@localhost:5432/cloudforge` | SQLAlchemy connection string using psycopg 3 driver |
-| `CORS_ORIGINS` | No | `http://localhost:5173` | Comma-separated list of allowed CORS origins |
-
----
-
-## Security notes
-
-- Docker containers share the host kernel. The cgroup limits and dropped capabilities reduce standard attack surface but do not provide microVM-grade isolation.
-- Never expose the backend port publicly without authentication.
-- Rotate database credentials before any production or shared use.
-
----
-
-## Project structure
+## Project Structure
 
 ```
 cloud-forge/
-├── main.py               # FastAPI application — all API routes
-├── database.py           # SQLAlchemy engine / session setup
-├── models.py             # ORM models (Project, Deployment)
-├── test_db.py            # Quick database connectivity test
-├── .env.example          # Configuration template
-├── .gitignore
-├── frontend/             # React 19 + Vite SPA
+├── main.py               # FastAPI application endpoints and container orchestration
+├── database.py           # SQLAlchemy database session engine
+├── models.py             # Relational data models (Project, Deployment)
+├── requirements.txt      # Python dependencies
+├── .env.example          # Safe configuration template
+├── .gitignore            # Git exclusion rules
+├── frontend/             # React 19 + Vite dashboard
 │   ├── src/
 │   │   └── App.jsx
 │   ├── package.json
 │   └── vite.config.js
-├── test-app/             # Sample Hello-World Python app
-│   ├── app.py
-│   └── Dockerfile        # Reference only
-└── migrations/           # Alembic database migrations
+├── test-app/             # Sample deployment project
+└── report-output/        # Academic Case Study documentation (PDF, HTML, MD)
 ```
 
 ---
 
-## Author
+## Security Model
 
-**Eben John Jose** — Registration Number 24BCE2459  
-[Programme / Branch placeholder] · [Institution placeholder]
+* **Kernel Sharing:** Standard Docker containers share the host Linux kernel. Cgroup resource caps, capability dropping, and read-only filesystems mitigate basic escalation, but multi-tenant cloud platforms require microVM technologies (e.g. AWS Firecracker or gVisor).
+* **Port Isolation:** Port 8000 is blocked from external access and is exposed strictly via the local reverse proxy (Nginx).
+* **Credential Hygiene:** No credentials, tokens, or private keys are committed to Git.
+
+---
+
+## Academic Details
+
+* **Author:** Eben John Jose
+* **Registration Number:** 24BCE2459
+* **Live Deployment URL:** http://54.252.152.116/
+* **Repository:** https://github.com/Eben923/cloud-forge
