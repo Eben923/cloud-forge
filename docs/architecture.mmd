@@ -1,0 +1,41 @@
+graph TD
+    Client["User Browser / Client"]
+    
+    subgraph VPC ["AWS VPC (10.0.0.0/16) - ap-southeast-2"]
+        subgraph PublicSubnet ["Public Subnet (10.0.1.0/24)"]
+            subgraph EC2Host ["EC2 t3.micro (Amazon Linux 2023)"]
+                Nginx["Nginx Reverse Proxy (Port 80)"]
+                ReactSPA["Static React 19 SPA (/var/www/cloudforge)"]
+                FastAPI["FastAPI Backend (127.0.0.1:8000)<br>systemd: cloudforge.service"]
+                Postgres["PostgreSQL 15 (Docker)<br>Host volume: /var/lib/cloudforge/pgdata"]
+                DockerDaemon["Host Docker Daemon<br>/var/run/docker.sock"]
+                
+                subgraph ContainerSandbox ["Ephemeral Container Sandbox"]
+                    TargetApp["Application Container<br>• 128 MiB RAM quota<br>• 0.5 CPU limit<br>• 64 PIDs ceiling<br>• Read-only rootfs<br>• cap_drop: ALL<br>• User: nobody<br>• network_disabled: true<br>• 30s timeout watchdog"]
+                end
+            end
+        end
+    end
+
+    subgraph AWSServices ["AWS Managed Cloud Services"]
+        S3["Amazon S3 Artifacts Bucket<br>• SSE-AES256<br>• Block Public Access<br>• 30-Day Expiration Lifecycle"]
+        SSM["AWS Systems Manager<br>• SSM Session Manager (Key-less shell)<br>• Parameter Store (DB Password)"]
+        CW["Amazon CloudWatch<br>• Log Group (/cloudforge/app)<br>• High CPU Alarm (>80%)<br>• Status Check Failed Alarm"]
+        SNS["Amazon SNS Alert Topic<br>Email Notifications"]
+        Budgets["AWS Budgets<br>Monthly Cost Ceiling Alert"]
+        IAM["IAM Role & Instance Profile<br>Least-privilege S3/SSM/CloudWatch"]
+    end
+
+    %% Traffic flows
+    Client -->|HTTP Port 80| Nginx
+    Nginx -->|Static Assets| ReactSPA
+    Nginx -->|Proxy: /projects, /health| FastAPI
+    FastAPI -->|psycopg 3| Postgres
+    FastAPI -->|docker-py SDK| DockerDaemon
+    DockerDaemon -->|Build & Run isolated| TargetApp
+    FastAPI -.->|Store / Retrieve ZIPs| S3
+    FastAPI -.->|Fetch Secure DB Pass| SSM
+    EC2Host -.->|Role Credentials & IMDSv2| IAM
+    EC2Host -.->|Logs & Metrics| CW
+    CW -->|Trigger Alarm| SNS
+    Budgets -->|Cost Exceeded Alert| SNS
