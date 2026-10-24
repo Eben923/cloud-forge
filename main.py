@@ -440,6 +440,19 @@ MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB
 MAX_EXTRACTED_SIZE = 25 * 1024 * 1024  # 25 MB
 MAX_ARCHIVE_FILES = 100
 
+S3_BUCKET = os.getenv("S3_BUCKET")
+
+
+def get_s3_client():
+    if not S3_BUCKET:
+        return None
+    try:
+        import boto3
+        region = os.getenv("AWS_REGION", "ap-southeast-2")
+        return boto3.client("s3", region_name=region)
+    except Exception:
+        return None
+
 
 @app.post("/projects/{project_id}/upload")
 async def upload_project(
@@ -564,6 +577,21 @@ async def upload_project(
         saved_path = project_dir / saved_name
         saved_path.write_bytes(contents)
 
+        # Optional S3 persistence (fallback to local if S3_BUCKET is unset or upload fails)
+        s3 = get_s3_client()
+        if s3:
+            try:
+                s3_key = f"uploads/{project_id}/{saved_name}"
+                s3.put_object(
+                    Bucket=S3_BUCKET,
+                    Key=s3_key,
+                    Body=contents,
+                    ContentType="application/zip",
+                )
+            except Exception as exc:
+                import logging
+                logging.getLogger("cloudforge").warning(f"S3 upload sync failed: {exc}")
+
         return {
             "message": "ZIP uploaded and validated successfully.",
             "project_id": project_id,
@@ -633,6 +661,18 @@ def build_uploaded_project(
         )
 
     zip_path = UPLOAD_DIR / str(project_id) / saved_name
+
+    # If local file does not exist, check if it can be retrieved from S3
+    if not zip_path.is_file():
+        s3 = get_s3_client()
+        if s3:
+            try:
+                s3_key = f"uploads/{project_id}/{saved_name}"
+                zip_path.parent.mkdir(parents=True, exist_ok=True)
+                s3.download_file(S3_BUCKET, s3_key, str(zip_path))
+            except Exception as exc:
+                import logging
+                logging.getLogger("cloudforge").warning(f"S3 download failed for key {s3_key}: {exc}")
 
     if not zip_path.is_file():
         raise HTTPException(
