@@ -106,7 +106,31 @@ app.add_middleware(
 
 
 # --------------------------------------------------
-# 3. DATABASE SESSION
+# 3. AUTHENTICATION & SECURITY (OPTIONAL API KEY)
+# --------------------------------------------------
+
+from fastapi.security import APIKeyHeader
+
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+REQUIRED_API_KEY = os.getenv("API_KEY")
+
+
+def verify_api_key(api_key: str | None = Depends(API_KEY_HEADER)):
+    """
+    Enforce X-API-Key authentication when API_KEY environment variable is configured.
+    Falls back to unauthenticated access when API_KEY is unset (for seamless local development).
+    """
+    if REQUIRED_API_KEY:
+        if not api_key or api_key != REQUIRED_API_KEY:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or missing X-API-Key authentication header.",
+            )
+    return api_key
+
+
+# --------------------------------------------------
+# 4. DATABASE SESSION
 # --------------------------------------------------
 
 def get_db():
@@ -118,7 +142,7 @@ def get_db():
 
 
 # --------------------------------------------------
-# 4. PYDANTIC SCHEMAS
+# 5. PYDANTIC SCHEMAS
 # --------------------------------------------------
 
 class ProjectCreate(BaseModel):
@@ -170,6 +194,7 @@ def health_check():
     "/projects",
     response_model=ProjectResponse,
     status_code=201,
+    dependencies=[Depends(verify_api_key)],
 )
 def create_project(
     project_data: ProjectCreate,
@@ -191,6 +216,7 @@ def create_project(
 @app.get(
     "/projects",
     response_model=list[ProjectResponse],
+    dependencies=[Depends(verify_api_key)],
 )
 def list_projects(db: Session = Depends(get_db)):
     return db.query(Project).order_by(Project.id.desc()).all()
@@ -199,6 +225,7 @@ def list_projects(db: Session = Depends(get_db)):
 @app.get(
     "/projects/{project_id}",
     response_model=ProjectResponse,
+    dependencies=[Depends(verify_api_key)],
 )
 def get_project(
     project_id: int,
@@ -225,6 +252,7 @@ def get_project(
     "/projects/{project_id}/deployments",
     response_model=DeploymentResponse,
     status_code=201,
+    dependencies=[Depends(verify_api_key)],
 )
 def create_deployment(
     project_id: int,
@@ -382,6 +410,7 @@ def create_deployment(
 @app.get(
     "/projects/{project_id}/deployments",
     response_model=list[DeploymentResponse],
+    dependencies=[Depends(verify_api_key)],
 )
 def list_project_deployments(
     project_id: int,
@@ -412,6 +441,7 @@ def list_project_deployments(
 @app.get(
     "/deployments/{deployment_id}",
     response_model=DeploymentResponse,
+    dependencies=[Depends(verify_api_key)],
 )
 def get_deployment(
     deployment_id: int,
@@ -454,7 +484,10 @@ def get_s3_client():
         return None
 
 
-@app.post("/projects/{project_id}/upload")
+@app.post(
+    "/projects/{project_id}/upload",
+    dependencies=[Depends(verify_api_key)],
+)
 async def upload_project(
     project_id: int,
     file: UploadFile = File(...),
@@ -561,12 +594,22 @@ async def upload_project(
                     detail="The ZIP must contain at least one Python (.py) file.",
                 )
 
-            # Verify the ZIP entries can be read before saving.
+            # Zip-bomb protection: verify decompressed stream chunk-by-chunk and enforce 25 MB limit
+            # on actual decompressed bytes, preventing spoofed header sizes.
+            streamed_total = 0
             for entry in entries:
                 if not entry.is_dir():
                     with archive.open(entry) as stream:
-                        while stream.read(64 * 1024):
-                            pass
+                        while True:
+                            chunk = stream.read(64 * 1024)
+                            if not chunk:
+                                break
+                            streamed_total += len(chunk)
+                            if streamed_total > MAX_EXTRACTED_SIZE:
+                                raise HTTPException(
+                                    status_code=413,
+                                    detail="The uncompressed archive exceeds the 25 MB limit.",
+                                )
 
         # Save the original archive using a generated filename.
         # The user's filename is never used as a filesystem path.
@@ -616,7 +659,10 @@ import shutil
 BUILD_DIR = Path(__file__).resolve().parent / "build_projects"
 
 
-@app.get("/projects/{project_id}/builds")
+@app.get(
+    "/projects/{project_id}/builds",
+    dependencies=[Depends(verify_api_key)],
+)
 def list_project_builds(
     project_id: int,
     db: Session = Depends(get_db),
@@ -635,7 +681,10 @@ def list_project_builds(
     return [serialize_build(row) for row in rows]
 
 
-@app.post("/projects/{project_id}/build")
+@app.post(
+    "/projects/{project_id}/build",
+    dependencies=[Depends(verify_api_key)],
+)
 def build_uploaded_project(
     project_id: int,
     saved_name: str,
@@ -753,7 +802,8 @@ def build_uploaded_project(
             build_path = BUILD_DIR / str(project_id) / build_id
             build_path.mkdir(parents=True, exist_ok=False)
 
-            # Extract each file manually; never trust archive paths.
+            # Extract each file manually with real-time extracted byte counting (Zip-bomb defense)
+            extracted_bytes = 0
             for entry in entries:
                 if entry.is_dir():
                     continue
@@ -774,7 +824,17 @@ def build_uploaded_project(
 
                 with archive.open(entry) as source:
                     with destination.open("wb") as target:
-                        shutil.copyfileobj(source, target)
+                        while True:
+                            chunk = source.read(64 * 1024)
+                            if not chunk:
+                                break
+                            extracted_bytes += len(chunk)
+                            if extracted_bytes > MAX_EXTRACTED_SIZE:
+                                raise HTTPException(
+                                    status_code=413,
+                                    detail="Extracted files exceed the 25 MB limit.",
+                                )
+                            target.write(chunk)
 
         # Generate our own Dockerfile; ignore any uploaded Dockerfile.
         dockerfile = (
