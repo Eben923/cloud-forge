@@ -12,8 +12,9 @@ Parameters:
 
   AdminCidr:
     Type: String
-    Default: 0.0.0.0/0
-    Description: CIDR block allowed for SSH administrative access (e.g. your IP/32).
+    AllowedPattern: '^((?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])/(?:1[6-9]|2[0-9]|3[0-2])$'
+    ConstraintDescription: 'Must be a valid IPv4 CIDR block with prefix between /16 and /32 (e.g., 203.0.113.50/32). World-open 0.0.0.0/0 is strictly prohibited.'
+    Description: CIDR block allowed for SSH administrative access. Administrators should supply their trusted public workstation IP with /32 (e.g. 203.0.113.50/32). An explicit CIDR block must be supplied; 0.0.0.0/0 is strictly rejected.
 
   InstanceType:
     Type: String
