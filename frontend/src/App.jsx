@@ -1,7 +1,10 @@
 import { useEffect, useState } from 'react'
 import './App.css'
 
-const API_URL = import.meta.env.VITE_API_URL !== undefined ? import.meta.env.VITE_API_URL : ''
+// API Base URL:
+// In production behind Nginx, relative path '' is used by default so requests route through the reverse proxy.
+// In development, VITE_API_URL can be set or the Vite dev proxy forwards /projects and /health to http://127.0.0.1:8000.
+const API_URL = (import.meta.env.VITE_API_URL !== undefined ? import.meta.env.VITE_API_URL : '').replace(/\/+$/, '')
 const MAX_ZIP_SIZE = 10 * 1024 * 1024
 
 function App() {
@@ -572,12 +575,23 @@ function App() {
           {loading ? (
             <div className="empty-state">Loading your projects...</div>
           ) : apiStatus !== 'Connected' ? (
-            <div className="empty-state">
+            <div className="empty-state error-state">
               <span className="empty-icon">⌁</span>
-              <h3>Backend connection unavailable</h3>
-              <p>Start your FastAPI server, then retry the connection.</p>
-              <button className="secondary-button" onClick={loadProjects}>
-                Retry connection
+              <h3>Backend API Unreachable</h3>
+              <p>
+                Could not connect to the Cloud Forge backend at{' '}
+                <code>{API_URL || window.location.origin}</code>.
+              </p>
+              {message && (
+                <p className="error-detail">
+                  <strong>Error details:</strong> {message}
+                </p>
+              )}
+              <p className="error-help">
+                Please verify that the FastAPI backend service (or Nginx reverse proxy) is active, then click below to retry.
+              </p>
+              <button className="primary-button" onClick={loadProjects}>
+                Retry Connection
               </button>
             </div>
           ) : projects.length === 0 ? (
