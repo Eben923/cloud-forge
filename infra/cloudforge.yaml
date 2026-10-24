@@ -1,0 +1,481 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Cloud Forge Infrastructure as Code: VPC, Public Subnet, Security Group,
+  S3 Artifact Bucket, CloudWatch Logs & Alarms, AWS Budgets, and EC2 Instance (t3.micro)
+  with IMDSv2, SSM Session Manager, and automated user-data provisioning.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: cloudforge
+    Description: Prefix for resource naming.
+
+  AdminCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR block allowed for SSH administrative access (e.g. your IP/32).
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type (Free Tier eligible in ap-southeast-2).
+
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64'
+    Description: SSM public parameter pointing to latest AL2023 x86_64 AMI.
+
+  MonthlyBudgetLimitUSD:
+    Type: Number
+    Default: 5
+    Description: Monthly budget spending limit in USD for AWS cost protection.
+
+  AlertEmail:
+    Type: String
+    Default: admin@example.com
+    Description: Email address for CloudWatch alarms and budget threshold alerts.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, 'admin@example.com']]
+
+Resources:
+  # ----------------------------------------------------------------------
+  # Networking: VPC, Subnet, Internet Gateway & Routes
+  # ----------------------------------------------------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-igw'
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-subnet'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-rt'
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # ----------------------------------------------------------------------
+  # Security Group
+  # ----------------------------------------------------------------------
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Cloud Forge web and administrative access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # HTTP for web UI and Nginx proxy
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow public HTTP web traffic through Nginx
+        # Administrative SSH strictly locked to AdminCidr
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AdminCidr
+          Description: Restrict SSH strictly to administrator IP
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-app-sg'
+
+  # ----------------------------------------------------------------------
+  # S3 Bucket (Private, Encrypted, 30-day lifecycle expiration)
+  # ----------------------------------------------------------------------
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-artifacts-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireUploadsAfter30Days
+            Prefix: uploads/
+            Status: Enabled
+            ExpirationInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-artifacts'
+
+  # ----------------------------------------------------------------------
+  # CloudWatch Logging & SNS Topic
+  # ----------------------------------------------------------------------
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/${EnvironmentName}/app'
+      RetentionInDays: 14
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${EnvironmentName}-alerts'
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ----------------------------------------------------------------------
+  # CloudWatch Alarms
+  # ----------------------------------------------------------------------
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-high-cpu'
+      AlarmDescription: Trigger alarm if CPU utilization exceeds 80% for 5 minutes
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref AppInstance
+      AlarmActions:
+        - !Ref AlertTopic
+
+  InstanceStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-status-check-failed'
+      AlarmDescription: Trigger alarm if EC2 instance status check fails
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref AppInstance
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # ----------------------------------------------------------------------
+  # AWS Budgets (Cost Guardrail)
+  # ----------------------------------------------------------------------
+  MonthlyCostBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub '${EnvironmentName}-monthly-cost'
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetLimitUSD
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+
+  # ----------------------------------------------------------------------
+  # IAM Role & Instance Profile (SSM Session Manager & S3 Access)
+  # ----------------------------------------------------------------------
+  AppInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Enables key-less Session Manager access
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        # Enables CloudWatch log shipping agent
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: S3ArtifactUploadsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub '${ArtifactBucket.Arn}/uploads/*'
+        - PolicyName: SSMParameterAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:PutParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${EnvironmentName}/*'
+
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref AppInstanceRole
+
+  # ----------------------------------------------------------------------
+  # EC2 Instance (t3.micro, IMDSv2, Nitro, UserData Provisioning)
+  # ----------------------------------------------------------------------
+  AppInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref AppInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+            DeleteOnTermination: true
+      # Enforce IMDSv2 (Session token required, hop limit 1)
+      LaunchTemplate: !Ref 'AWS::NoValue'
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+        HttpEndpoint: enabled
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          exec > /var/log/user-data.log 2>&1
+
+          echo "Starting Cloud Forge automated deployment..."
+          dnf update -y
+          dnf install -y docker nginx git python3.11 python3.11-pip
+
+          # 1. Setup 1GB swap space to avoid memory pressure on t3.micro
+          if [ ! -f /swapfile ]; then
+            dd if=/dev/zero of=/swapfile bs=128M count=8
+            chmod 600 /swapfile
+            mkswap /swapfile
+            swapon /swapfile
+            echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
+          fi
+
+          # 2. Start and enable Docker & Nginx
+          systemctl enable --now docker
+          systemctl enable --now nginx
+          usermod -aG docker ec2-user
+
+          # 3. Retrieve or bootstrap persistent PostgreSQL credentials via AWS SSM Parameter Store
+          mkdir -p /var/lib/cloudforge/pgdata
+          set +x
+          DB_PASSWORD=$(aws ssm get-parameter \
+            --name "/${EnvironmentName}/db_password" \
+            --with-decryption \
+            --query "Parameter.Value" \
+            --output text \
+            --region "${AWS::Region}" 2>/dev/null || true)
+
+          if [ -z "$DB_PASSWORD" ]; then
+            echo "Generating secure database password and registering in SSM Parameter Store..."
+            DB_PASSWORD=$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c 24)
+            aws ssm put-parameter \
+              --name "/${EnvironmentName}/db_password" \
+              --value "$DB_PASSWORD" \
+              --type "SecureString" \
+              --region "${AWS::Region}" 2>/dev/null || true
+          fi
+
+          docker run -d \
+            --name cloudforge-db \
+            --restart unless-stopped \
+            -e POSTGRES_USER=cloudforge \
+            -e POSTGRES_PASSWORD="$DB_PASSWORD" \
+            -e POSTGRES_DB=cloudforge \
+            -v /var/lib/cloudforge/pgdata:/var/lib/postgresql/data \
+            -p 127.0.0.1:5432:5432 \
+            postgres:15-alpine
+
+          unset DB_PASSWORD
+
+          # 4. Clone / Fetch application
+          mkdir -p /home/ec2-user/app
+          cd /home/ec2-user/app
+          git clone https://github.com/Eben923/cloud-forge.git repo
+          cp -r repo/* .
+          rm -rf repo
+
+          # Setup virtual environment and dependencies
+          python3.11 -m venv /home/ec2-user/app-venv
+          /home/ec2-user/app-venv/bin/pip install --upgrade pip
+          /home/ec2-user/app-venv/bin/pip install -r /home/ec2-user/app/requirements.txt
+
+          # Configure local environment file using SSM Parameter Store reference (no embedded secrets)
+          cat << 'ENVEOF' > /home/ec2-user/app/.env
+          SSM_DB_PASSWORD_PARAM=/${EnvironmentName}/db_password
+          DB_USER=cloudforge
+          DB_HOST=127.0.0.1
+          DB_PORT=5432
+          DB_NAME=cloudforge
+          S3_BUCKET=${ArtifactBucket}
+          AWS_REGION=${AWS::Region}
+          CORS_ORIGINS=http://localhost,http://127.0.0.1
+          ENVEOF
+          chmod 600 /home/ec2-user/app/.env
+          chown -R ec2-user:ec2-user /home/ec2-user/app
+
+          # Initialize database tables
+          /home/ec2-user/app-venv/bin/python3 -c "from database import engine, Base; import models; Base.metadata.create_all(bind=engine)"
+
+          # 5. Configure systemd unit for FastAPI
+          cat << 'SVCEOF' > /etc/systemd/system/cloudforge.service
+          [Unit]
+          Description=Cloud Forge FastAPI Application
+          After=network.target docker.service
+
+          [Service]
+          Type=simple
+          User=ec2-user
+          WorkingDirectory=/home/ec2-user/app
+          EnvironmentFile=/home/ec2-user/app/.env
+          ExecStart=/home/ec2-user/app-venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          SVCEOF
+
+          systemctl daemon-reload
+          systemctl enable --now cloudforge.service
+
+          # 6. Build and deploy frontend
+          mkdir -p /var/www/cloudforge
+          if [ -d /home/ec2-user/app/frontend/dist ]; then
+            cp -r /home/ec2-user/app/frontend/dist/* /var/www/cloudforge/
+          fi
+          chown -R nginx:nginx /var/www/cloudforge
+
+          # 7. Configure Nginx reverse proxy
+          cat << 'NGINXEOF' > /etc/nginx/conf.d/cloudforge.conf
+          server {
+              listen 80 default_server;
+              server_name _;
+              server_tokens off;
+
+              # Security Headers
+              add_header X-Content-Type-Options nosniff always;
+              add_header X-Frame-Options DENY always;
+              add_header X-XSS-Protection "1; mode=block" always;
+
+              location / {
+                  root /var/www/cloudforge;
+                  index index.html;
+                  try_files $uri $uri/ /index.html;
+              }
+
+              location /health {
+                  proxy_pass http://127.0.0.1:8000;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+
+              location /projects {
+                  proxy_pass http://127.0.0.1:8000;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  client_max_body_size 10M;
+              }
+          }
+          NGINXEOF
+
+          sed -i '/default_server/d' /etc/nginx/nginx.conf || true
+          nginx -t && systemctl reload nginx
+          echo "Cloud Forge provisioning finished successfully."
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-server'
+
+Outputs:
+  InstanceId:
+    Description: ID of the deployed Cloud Forge EC2 instance
+    Value: !Ref AppInstance
+
+  PublicIp:
+    Description: Public IPv4 address of the Cloud Forge server
+    Value: !GetAtt AppInstance.PublicIp
+
+  PublicDns:
+    Description: Public DNS name of the Cloud Forge server
+    Value: !GetAtt AppInstance.PublicDnsName
+
+  WebUrl:
+    Description: Web URL to access Cloud Forge dashboard
+    Value: !Sub 'http://${AppInstance.PublicIp}/'
+
+  ArtifactBucketName:
+    Description: S3 bucket name for application upload archives
+    Value: !Ref ArtifactBucket
+
+  AlertTopicArn:
+    Description: ARN of the SNS alert topic
+    Value: !Ref AlertTopic

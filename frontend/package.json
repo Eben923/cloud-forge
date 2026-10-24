@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "validate:cfn": "python -c \"import pathlib, cfnlint.api; m = cfnlint.api.lint_file(pathlib.Path('../infra/cloudforge.yaml')); exit(1) if m else print('CloudFormation template is valid (0 errors).')\""
   },
   "dependencies": {
     "react": "^19.3.1",
