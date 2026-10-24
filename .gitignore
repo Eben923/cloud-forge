@@ -1,0 +1,39 @@
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# React / Node
+node_modules/
+dist/
+npm-debug.log*
+
+# Local uploads and builds
+uploaded_projects/
+build_projects/
+
+# Local files and secrets
+*.db
+*.log
+secrets.json
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Test archives and backup files
+*.zip
+main_backup.py
+
+# Local environment and generated data
+.env
+__pycache__/
+uploaded_projects/
+build_projects/
