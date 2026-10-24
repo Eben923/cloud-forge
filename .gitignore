@@ -30,7 +30,9 @@ Thumbs.db
 
 # Test archives and backup files
 *.zip
+*.sql
 main_backup.py
+scratch/
 
 # Local environment and generated data
 .env
